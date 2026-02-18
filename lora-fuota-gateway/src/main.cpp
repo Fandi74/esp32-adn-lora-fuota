@@ -15,6 +15,7 @@ const char* mqtt_topic = "lora/ota/url";
 // ================= HARDWARE PINS (T3 V1.6.1) =================
 // ================= HARDWARE PINS (T3 V1.6.1 CONFIRMED) =================
 
+
 // LoRa Pins (Standard SPI)
 #define LORA_SCK     5
 #define LORA_MISO    19
