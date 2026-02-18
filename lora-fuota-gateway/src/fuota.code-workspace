@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "../../../../iot-device-cpp/dt-weather-station"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"array": "cpp",
+			"deque": "cpp",
+			"string": "cpp",
+			"unordered_map": "cpp",
+			"unordered_set": "cpp",
+			"vector": "cpp",
+			"string_view": "cpp",
+			"memory": "cpp",
+			"random": "cpp",
+			"initializer_list": "cpp",
+			"cstring": "cpp"
+		},
+		"stm32cube-ide-clangd.path": "cube"
+	}
+}
