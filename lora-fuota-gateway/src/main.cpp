@@ -4,19 +4,21 @@
 #include <SD.h>
 #include <SPI.h>
 #include <LoRa.h>
-#include <SSD1306Wire.h> 
+#include <SSD1306Wire.h>
+
+// #include <mysecrets.h>
+
+#define WIFI_SSID "YourSSID"
+#define WIFI_PASSWORD "YourPassword"
+#define BROKER_SERVER "broker.hivemq.com"
+#define LORA_TOPIC "lora/ota/url"
 
 // ================= USER CONFIG =================
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASS";
-const char* mqtt_server = "broker.hivemq.com";
-const char* mqtt_topic = "lora/ota/url";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+const char* mqtt_server = BROKER_SERVER ; //broker.hivemq.com
+const char* mqtt_topic = LORA_TOPIC; //lora/ota/url
 
-// ================= HARDWARE PINS (T3 V1.6.1) =================
-// ================= HARDWARE PINS (T3 V1.6.1 CONFIRMED) =================
-
-
-// LoRa Pins (Standard SPI)
 #define LORA_SCK     5
 #define LORA_MISO    19
 #define LORA_MOSI    27
@@ -24,15 +26,13 @@ const char* mqtt_topic = "lora/ota/url";
 #define LORA_RST     23
 #define LORA_DIO0    26
 
-// SD Card Pins (HSPI)
 #define SD_SCK       14
 #define SD_MISO      2
 #define SD_MOSI      15
 #define SD_CS        13
 
-// OLED Pins (Standard I2C)
-#define OLED_SDA     21  // Corrected from 4
-#define OLED_SCL     22  // Corrected from 15
+#define OLED_SDA     21
+#define OLED_SCL     22
 #define OLED_ADDR    0x3C
 
 // ================= GLOBALS =================
@@ -43,110 +43,6 @@ SPIClass sdSPI(HSPI); // Create a separate SPI instance for SD Card
 
 String downloadUrl = "";
 bool startProcess = false;
-
-// ================= SETUP =================
-void setup() {
-  Serial.begin(115200);
-  
-  // 1. Init OLED
-  pinMode(16, OUTPUT); // OLED Reset pin for some boards
-  digitalWrite(16, LOW); delay(50); digitalWrite(16, HIGH);
-  display.init();
-  display.flipScreenVertically();
-  display.setFont(ArialMT_Plain_10);
-  showStatus("Booting...");
-
-  // 2. Init SD Card (on separate SPI bus)
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSPI)) {
-    Serial.println("SD Mount Failed!");
-    showStatus("SD Fail!");
-    while(1); // Stop if no storage
-  }
-  Serial.println("SD Card Ready.");
-
-  // 3. Init LoRa (on default SPI bus)
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(923E6)) {
-    Serial.println("LoRa Init Failed!");
-    showStatus("LoRa Fail!");
-    while(1);
-  }
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5); // 4/5
-  Serial.println("LoRa Ready (923MHz).");
-
-  // 4. Connect WiFi (Timeout: 60s)
-  unsigned long wifiStart = millis();
-  WiFi.begin(ssid, password);
-  showStatus("Connecting WiFi...");
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - wifiStart > 60000) {
-      Serial.println("WiFi Failed: Timeout > 60s");
-      showStatus("WiFi Failed!");
-      while(1) { delay(100); } // Stop here forever
-    }
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi Success.");
-  showStatus("WiFi OK.");
-
-  // 5. Connect MQTT (Timeout: 120s)
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(mqttCallback);
-  
-  unsigned long mqttStart = millis();
-  showStatus("Connecting Broker...");
-  
-  while (!client.connected()) {
-    if (client.connect("T3_Gateway_Client")) {
-      Serial.println("Broker Connected");
-      client.subscribe(mqtt_topic, 1); // QoS 1
-    } else {
-      if (millis() - mqttStart > 120000) {
-        Serial.println("Broker Failed: Timeout > 120s");
-        showStatus("Broker Failed!");
-        while(1) { delay(100); } // Stop here forever
-      }
-      Serial.print(".");
-      delay(2000);
-    }
-  }
-  showStatus("Ready! Waiting...");
-}
-
-// ================= MAIN LOOP =================
-void loop() {
-  // Keep MQTT alive
-  if (!client.connected()) {
-     // Optional: Reconnect logic if you want, or just fail based on your strict rules.
-     // For now, we assume if it drops, we try to reconnect simply.
-     if (client.connect("T3_Gateway_Client")) {
-        client.subscribe(mqtt_topic, 1);
-     }
-  }
-  client.loop();
-
-  // If callback set the flag, start the job
-  if (startProcess) {
-    startProcess = false; // Reset flag
-    
-    // Step A: Download
-    if (downloadToSD(downloadUrl)) {
-      // Step B: Broadcast
-      broadcastFromSD();
-    } else {
-      showStatus("Download Error");
-    }
-    
-    // Resume listening
-    showStatus("Job Done. Waiting...");
-  }
-}
 
 // ================= FUNCTIONS =================
 
@@ -160,6 +56,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   
   downloadUrl = msg;
   startProcess = true; // Trigger loop
+}
+
+// Helper for OLED
+void showStatus(String s) {
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 0, "GW Status:");
+  display.drawString(0, 25, s);
+  display.display();
 }
 
 // Download HTTP -> SD Card
@@ -277,11 +182,107 @@ void broadcastFromSD() {
   Serial.println("Broadcast Finished.");
 }
 
-// Helper for OLED
-void showStatus(String s) {
-  display.clear();
+// ================= SETUP =================
+
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. Init OLED
+  pinMode(16, OUTPUT); // OLED Reset pin for some boards
+  digitalWrite(16, LOW); delay(50); digitalWrite(16, HIGH);
+  display.init();
+  display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "GW Status:");
-  display.drawString(0, 25, s);
-  display.display();
+  showStatus("Booting...");
+
+  // 2. Init SD Card (on separate SPI bus)
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI)) {
+    Serial.println("SD Mount Failed!");
+    showStatus("SD Fail!");
+    while(1); // Stop if no storage
+  }
+  Serial.println("SD Card Ready.");
+
+  // 3. Init LoRa (on default SPI bus)
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(923E6)) {
+    Serial.println("LoRa Init Failed!");
+    showStatus("LoRa Fail!");
+    while(1);
+  }
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5); // 4/5
+  Serial.println("LoRa Ready (923MHz).");
+
+  // 4. Connect WiFi (Timeout: 60s)
+  unsigned long wifiStart = millis();
+  WiFi.begin(ssid, password);
+  showStatus("Connecting WiFi...");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - wifiStart > 60000) {
+      Serial.println("WiFi Failed: Timeout > 60s");
+      showStatus("WiFi Failed!");
+      while(1) { delay(100); } // Stop here forever
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Success.");
+  showStatus("WiFi OK.");
+
+  // 5. Connect MQTT (Timeout: 120s)
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(mqttCallback);
+  
+  unsigned long mqttStart = millis();
+  showStatus("Connecting Broker...");
+  
+  while (!client.connected()) {
+    if (client.connect("T3_Gateway_Client")) {
+      Serial.println("Broker Connected");
+      client.subscribe(mqtt_topic, 1); // QoS 1
+    } else {
+      if (millis() - mqttStart > 120000) {
+        Serial.println("Broker Failed: Timeout > 120s");
+        showStatus("Broker Failed!");
+        while(1) { delay(100); } // Stop here forever
+      }
+      Serial.print(".");
+      delay(2000);
+    }
+  }
+  showStatus("Ready! Waiting...");
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  // Keep MQTT alive
+  if (!client.connected()) {
+     // Optional: Reconnect logic if you want, or just fail based on your strict rules.
+     // For now, we assume if it drops, we try to reconnect simply.
+     if (client.connect("T3_Gateway_Client")) {
+        client.subscribe(mqtt_topic, 1);
+     }
+  }
+  client.loop();
+
+  // If callback set the flag, start the job
+  if (startProcess) {
+    startProcess = false; // Reset flag
+    
+    // Step A: Download
+    if (downloadToSD(downloadUrl)) {
+      // Step B: Broadcast
+      broadcastFromSD();
+    } else {
+      showStatus("Download Error");
+    }
+    
+    // Resume listening
+    showStatus("Job Done. Waiting...");
+  }
 }
