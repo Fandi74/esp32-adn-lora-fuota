@@ -201,7 +201,7 @@ void setup() {
   if (!SD.begin(SD_CS, sdSPI)) {
     Serial.println("SD Mount Failed!");
     showStatus("SD Fail!");
-    // while(1); // Stop if no storage
+    while(1); // Stop if no storage
   }
   Serial.println("SD Card Ready.");
 
