@@ -23,41 +23,12 @@ int validPacketsReceived = 0;
 int highestIdReceived = -1;
 int lostPackets = 0;
 
-void setup() {
-  Serial.begin(115200);
-
-  // 1. Init OLED
-  pinMode(16, OUTPUT); 
-  digitalWrite(16, LOW); delay(50); digitalWrite(16, HIGH);
-  display.init();
-  display.flipScreenVertically();
+void showStatus(String s) {
+  display.clear();
   display.setFont(ArialMT_Plain_10);
-  showStatus("Node Booting...");
-
-  // 2. Init LoRa
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
-  
-  if (!LoRa.begin(923E6)) {
-    Serial.println("LoRa Init Failed!");
-    showStatus("LoRa Fail!");
-    while(1);
-  }
-  
-  // MATCH GATEWAY EXACTLY
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
-  
-  Serial.println("Node Ready. Profiling Mode.");
-  showStatus("Listening...");
-}
-
-void loop() {
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    processPacket(packetSize);
-  }
+  display.drawString(0, 0, "Node Status:");
+  display.drawString(0, 25, s);
+  display.display();
 }
 
 // ================= FUNCTIONS =================
@@ -71,7 +42,11 @@ void processPacket(int packetSize) {
   }
   
   String strData = "";
-  for(int k=0; k<i && k<10; k++) strData += (char)buffer[k];
+  // Read up to 24 characters to safely capture "START:9999999"
+  int limit = (i < 24) ? i : 24;
+  for(int k=0; k<limit; k++) {
+    strData += (char)buffer[k];
+  }
   
   // --- COMMAND: START ---
   if (strData.startsWith("START:")) {
@@ -170,10 +145,40 @@ void processPacket(int packetSize) {
   }
 }
 
-void showStatus(String s) {
-  display.clear();
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Init OLED
+  // pinMode(16, OUTPUT); 
+  // digitalWrite(16, LOW); delay(50); digitalWrite(16, HIGH);
+  display.init();
+  display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "Node Status:");
-  display.drawString(0, 25, s);
-  display.display();
+  showStatus("Node Booting...");
+
+  // 2. Init LoRa
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  
+  if (!LoRa.begin(923E6)) {
+    Serial.println("LoRa Init Failed!");
+    showStatus("LoRa Fail!");
+    while(1);
+  }
+  
+  // MATCH GATEWAY EXACTLY
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  
+  Serial.println("Node Ready. Profiling Mode.");
+  showStatus("Listening..."); 
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    processPacket(packetSize);
+  }
 }
