@@ -42,8 +42,14 @@
 
   7. Staging storage on node
      - Store valid chunks into a temporary firmware image before flashing.
-     - Prototype options: SD, LittleFS, SPIFFS, or direct OTA partition writes.
-     - Start with a staged file if available because it is easier to debug.
+     - For this stage, use an SD card as the first target because random writes,
+       retry handling, and manual inspection are easiest.
+     - Write packet_id * chunk_size offsets into /update.bin so missing packets
+       can be filled later without restarting the whole transfer.
+     - If the node does not have an SD slot, internal flash can be used later to
+       save hardware cost, using LittleFS/SPIFFS or the inactive OTA partition.
+     - Start with a staged file on SD because it is easier to debug than writing
+       directly into OTA flash.
 
   8. Full image verification
      - After all chunks are present, calculate SHA-256 or CRC32 over the staged
