@@ -28,6 +28,11 @@ int validPacketsReceived = 0;
 int highestIdReceived = -1;
 int lostPackets = 0;
 int badPackets = 0;
+unsigned long lastOledFrameAt = 0;
+uint8_t oledFrame = 0;
+
+const unsigned long OLED_IDLE_INTERVAL_MS = 500;
+const unsigned long OLED_RX_INTERVAL_MS = 150;
 
 void showStatus(String s) {
   display.clear();
@@ -38,6 +43,63 @@ void showStatus(String s) {
 }
 
 // ================= FUNCTIONS =================
+
+void drawProgressBar(uint8_t progressPercent) {
+  if (progressPercent > 100) {
+    progressPercent = 100;
+  }
+
+  int fillWidth = (progressPercent * 126) / 100;
+  display.drawRect(0, 54, 128, 8);
+  display.fillRect(1, 55, fillWidth, 6);
+}
+
+void drawListeningAnimation() {
+  unsigned long now = millis();
+  if (now - lastOledFrameAt < OLED_IDLE_INTERVAL_MS) {
+    return;
+  }
+
+  lastOledFrameAt = now;
+  oledFrame++;
+
+  const char spinner[] = "|/-\\";
+  int pulseX = (oledFrame % 8) * 16;
+
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 0, "Node Status:");
+  display.drawString(0, 18, "LoRa open " + String(spinner[oledFrame % 4]));
+  display.drawString(0, 34, "Waiting FUOTA");
+  display.drawRect(0, 54, 128, 8);
+  display.fillRect(pulseX, 55, 12, 6);
+  display.display();
+}
+
+void drawReceivingAnimation(bool force) {
+  unsigned long now = millis();
+  if (!force && now - lastOledFrameAt < OLED_RX_INTERVAL_MS) {
+    return;
+  }
+
+  lastOledFrameAt = now;
+  oledFrame++;
+
+  const char spinner[] = "|/-\\";
+  uint8_t progressPercent = 0;
+  if (totalExpectedPackets > 0) {
+    progressPercent = (uint8_t)(((uint32_t)validPacketsReceived * 100UL) / totalExpectedPackets);
+  }
+
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 0, "FUOTA RX " + String(spinner[oledFrame % 4]));
+  display.drawString(0, 13, "Session: " + String(activeSessionId));
+  display.drawString(0, 26, "Pkts: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
+  display.drawString(0, 39, "Miss: " + String(lostPackets) + " Bad: " + String(badPackets));
+  drawProgressBar(progressPercent);
+  display.display();
+}
 
 void processPacket(int packetSize) {
   uint8_t buffer[FUOTA_MAX_FRAME_SIZE];
@@ -94,7 +156,7 @@ void processPacket(int packetSize) {
     Serial.printf("Firmware version: %u\n", (unsigned int)metadata.firmwareVersion);
     Serial.printf("Image CRC32: 0x%08X\n", (unsigned int)expectedImageCrc32);
 
-    showStatus("Incoming stream...");
+    drawReceivingAnimation(true);
     return;
   }
 
@@ -151,24 +213,11 @@ void processPacket(int packetSize) {
     validPacketsReceived++;
     int expectedUpToNow = highestIdReceived + 1;
     lostPackets = expectedUpToNow - validPacketsReceived;
+    drawReceivingAnimation(false);
 
     if (validPacketsReceived % 10 == 0) {
       float currentCorruptRate = ((float)lostPackets / (float)expectedUpToNow) * 100.0;
-      
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.drawString(0, 0, "Receiving OTA...");
-      
-      // e.g., "Pkts: 450 / 2000"
-      display.drawString(0, 15, "Pkts: " + String(validPacketsReceived) + " / " + String(totalExpectedPackets));
-      
-      // e.g., "Corrupted: 23"
-      display.drawString(0, 30, "Corrupted: " + String(lostPackets));
-      
-      // e.g., "Rate: 4.8%"
-      display.drawString(0, 45, "Rate: " + String(currentCorruptRate, 1) + "%");
-      display.display();
-      
+
       Serial.printf("ID: %u | Len: %u | Rx: %d | Lost: %d | Bad: %d | Rate: %.1f%%\n",
                     header.packetId, header.payloadLen, validPacketsReceived, lostPackets,
                     badPackets, currentCorruptRate);
@@ -214,5 +263,9 @@ void loop() {
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
     processPacket(packetSize);
+  } else if (isReceiving) {
+    drawReceivingAnimation(false);
+  } else {
+    drawListeningAnimation();
   }
 }
