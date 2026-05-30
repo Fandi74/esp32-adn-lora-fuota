@@ -20,6 +20,8 @@ static const uint8_t FUOTA_HEADER_SIZE = 15;
 static const uint8_t FUOTA_METADATA_PAYLOAD_SIZE = 16;
 static const uint8_t FUOTA_MAX_PAYLOAD_SIZE = FUOTA_CHUNK_SIZE;
 static const uint16_t FUOTA_MAX_FRAME_SIZE = FUOTA_HEADER_SIZE + FUOTA_MAX_PAYLOAD_SIZE;
+static const uint16_t FUOTA_MAX_TRACKED_PACKETS = 5000;
+static const uint16_t FUOTA_RECEIVE_BITMAP_SIZE = (FUOTA_MAX_TRACKED_PACKETS + 7) / 8;
 
 struct FuotaFrameHeader {
   uint8_t type;

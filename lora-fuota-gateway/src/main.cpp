@@ -169,8 +169,9 @@ void broadcastFromSD() {
   uint32_t imageCrc32 = calculateFileCrc32(f);
   uint8_t buffer[FUOTA_CHUNK_SIZE];
 
-  if (calculatedPackets == 0 || calculatedPackets > 65535) {
-    Serial.println("Invalid packet count");
+  if (calculatedPackets == 0 || calculatedPackets > FUOTA_MAX_TRACKED_PACKETS) {
+    Serial.printf("Invalid packet count: %u. Prototype limit is %u packets.\n",
+                  (unsigned int)calculatedPackets, FUOTA_MAX_TRACKED_PACKETS);
     f.close();
     return;
   }

@@ -28,11 +28,14 @@ int validPacketsReceived = 0;
 int highestIdReceived = -1;
 int lostPackets = 0;
 int badPackets = 0;
+int duplicatePackets = 0;
 unsigned long lastOledFrameAt = 0;
 uint8_t oledFrame = 0;
+uint8_t receivedPacketBitmap[FUOTA_RECEIVE_BITMAP_SIZE];
 
 const unsigned long OLED_IDLE_INTERVAL_MS = 500;
 const unsigned long OLED_RX_INTERVAL_MS = 150;
+const uint8_t MAX_MISSING_IDS_TO_LOG = 32;
 
 void showStatus(String s) {
   display.clear();
@@ -61,8 +64,69 @@ bool isValidMetadata(const FuotaMetadata& metadata) {
 
   uint32_t calculatedPackets = (metadata.fileSize + metadata.chunkSize - 1) / metadata.chunkSize;
   return calculatedPackets > 0 &&
-         calculatedPackets <= 65535 &&
+         calculatedPackets <= FUOTA_MAX_TRACKED_PACKETS &&
          metadata.totalPackets == calculatedPackets;
+}
+
+void resetReceiveBitmap() {
+  for (uint16_t i = 0; i < FUOTA_RECEIVE_BITMAP_SIZE; i++) {
+    receivedPacketBitmap[i] = 0;
+  }
+}
+
+bool isPacketReceived(uint16_t packetId) {
+  if (packetId >= FUOTA_MAX_TRACKED_PACKETS) {
+    return false;
+  }
+
+  uint16_t byteIndex = packetId / 8;
+  uint8_t bitMask = 1 << (packetId % 8);
+  return (receivedPacketBitmap[byteIndex] & bitMask) != 0;
+}
+
+void markPacketReceived(uint16_t packetId) {
+  if (packetId >= FUOTA_MAX_TRACKED_PACKETS) {
+    return;
+  }
+
+  uint16_t byteIndex = packetId / 8;
+  uint8_t bitMask = 1 << (packetId % 8);
+  receivedPacketBitmap[byteIndex] |= bitMask;
+}
+
+int calculateMissingPackets() {
+  int missing = 0;
+  for (uint16_t packetId = 0; packetId < totalExpectedPackets; packetId++) {
+    if (!isPacketReceived(packetId)) {
+      missing++;
+    }
+  }
+  return missing;
+}
+
+void printMissingPacketPreview() {
+  if (lostPackets <= 0) {
+    return;
+  }
+
+  Serial.print("Missing packet IDs");
+  if (lostPackets > MAX_MISSING_IDS_TO_LOG) {
+    Serial.printf(" (first %u)", MAX_MISSING_IDS_TO_LOG);
+  }
+  Serial.print(": ");
+
+  uint8_t printed = 0;
+  for (uint16_t packetId = 0; packetId < totalExpectedPackets && printed < MAX_MISSING_IDS_TO_LOG; packetId++) {
+    if (!isPacketReceived(packetId)) {
+      if (printed > 0) {
+        Serial.print(", ");
+      }
+      Serial.print(packetId);
+      printed++;
+    }
+  }
+
+  Serial.println();
 }
 
 void drawListeningAnimation() {
@@ -107,7 +171,7 @@ void drawReceivingAnimation(bool force) {
   display.drawString(0, 0, "FUOTA RX " + String(spinner[oledFrame % 4]));
   display.drawString(0, 13, "Session: " + String(activeSessionId));
   display.drawString(0, 26, "Pkts: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
-  display.drawString(0, 39, "Miss: " + String(lostPackets) + " Bad: " + String(badPackets));
+  display.drawString(0, 39, "M:" + String(lostPackets) + " B:" + String(badPackets) + " D:" + String(duplicatePackets));
   drawProgressBar(progressPercent);
   display.display();
 }
@@ -167,6 +231,8 @@ void processPacket(int packetSize) {
     highestIdReceived = -1;
     lostPackets = 0;
     badPackets = 0;
+    duplicatePackets = 0;
+    resetReceiveBitmap();
 
     Serial.println("\n--- FUOTA METADATA ---");
     Serial.printf("Session: %u\n", activeSessionId);
@@ -189,9 +255,7 @@ void processPacket(int packetSize) {
   if (header.type == FUOTA_FRAME_END) {
     if (isReceiving) {
       isReceiving = false;
-      lostPackets = totalExpectedPackets > validPacketsReceived
-        ? totalExpectedPackets - validPacketsReceived
-        : 0;
+      lostPackets = calculateMissingPackets();
       float finalMissingRate = totalExpectedPackets > 0
         ? ((float)lostPackets / (float)totalExpectedPackets) * 100.0
         : 0.0;
@@ -201,18 +265,20 @@ void processPacket(int packetSize) {
       Serial.printf("Received: %d\n", validPacketsReceived);
       Serial.printf("Missing: %d\n", lostPackets);
       Serial.printf("Bad CRC: %d\n", badPackets);
+      Serial.printf("Duplicates: %d\n", duplicatePackets);
       Serial.printf("Missing Rate: %.2f%%\n", finalMissingRate);
 
       display.clear();
       display.setFont(ArialMT_Plain_10);
       display.drawString(0, 0, "--- FINISHED ---");
       display.drawString(0, 15, "Rx: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
-      display.drawString(0, 30, "Miss: " + String(lostPackets) + " Bad: " + String(badPackets));
+      display.drawString(0, 30, "M:" + String(lostPackets) + " B:" + String(badPackets) + " D:" + String(duplicatePackets));
       display.drawString(0, 45, "Miss: " + String(finalMissingRate, 1) + "%");
       display.display();
 
-      if (lostPackets > 0 || badPackets > 0) {
-        Serial.println("[PLACEHOLDER] Generate missing packet list for retry.");
+      if (lostPackets > 0) {
+        printMissingPacketPreview();
+        Serial.println("[PLACEHOLDER] Send missing packet IDs back to gateway for retry.");
       } else {
         Serial.println("[PLACEHOLDER] Image complete. Verify staged file before OTA.");
       }
@@ -221,6 +287,13 @@ void processPacket(int packetSize) {
   }
 
   if (header.type == FUOTA_FRAME_DATA && isReceiving) {
+    if (header.packetId >= totalExpectedPackets) {
+      badPackets++;
+      Serial.printf("Out-of-range packet ID: %u | Total: %u\n",
+                    header.packetId, totalExpectedPackets);
+      return;
+    }
+
     if (header.payloadLen > expectedChunkSize) {
       badPackets++;
       Serial.printf("Unexpected payload length. ID: %u | Len: %u\n",
@@ -232,6 +305,13 @@ void processPacket(int packetSize) {
       highestIdReceived = header.packetId;
     }
 
+    if (isPacketReceived(header.packetId)) {
+      duplicatePackets++;
+      drawReceivingAnimation(false);
+      return;
+    }
+
+    markPacketReceived(header.packetId);
     validPacketsReceived++;
     int expectedUpToNow = highestIdReceived + 1;
     lostPackets = expectedUpToNow > validPacketsReceived
