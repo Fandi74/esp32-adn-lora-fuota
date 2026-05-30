@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <SSD1306Wire.h>
+#include <fuota_protocol.h>
 
 // #include <mysecrets.h>
 
@@ -66,6 +67,38 @@ void showStatus(String s) {
   display.drawString(0, 0, "GW Status:");
   display.drawString(0, 25, s);
   display.display();
+}
+
+uint32_t calculateFileCrc32(File& f) {
+  uint8_t buffer[256];
+  uint32_t crc = 0xFFFFFFFFUL;
+
+  f.seek(0);
+  while (f.available()) {
+    int bytesRead = f.read(buffer, sizeof(buffer));
+    if (bytesRead > 0) {
+      crc = fuotaCrc32Update(crc, buffer, bytesRead);
+    }
+  }
+  f.seek(0);
+
+  return ~crc;
+}
+
+bool sendFuotaFrame(uint8_t type, uint16_t sessionId, uint16_t packetId,
+                    const uint8_t* payload, uint8_t payloadLen) {
+  if (payloadLen > FUOTA_MAX_PAYLOAD_SIZE) {
+    Serial.println("FUOTA payload too large");
+    return false;
+  }
+
+  uint8_t frame[FUOTA_MAX_FRAME_SIZE];
+  size_t frameLen = fuotaWriteFrame(frame, type, sessionId, packetId, payload, payloadLen);
+
+  LoRa.beginPacket();
+  LoRa.write(frame, frameLen);
+  LoRa.endPacket();
+  return true;
 }
 
 // Download HTTP -> SD Card
@@ -131,33 +164,45 @@ void broadcastFromSD() {
   }
 
   size_t fileSize = f.size();
-  int packetSize = 250; 
-  int totalPackets = (fileSize / packetSize) + 1;
-  uint8_t buffer[packetSize];
+  uint32_t calculatedPackets = (fileSize + FUOTA_CHUNK_SIZE - 1) / FUOTA_CHUNK_SIZE;
+  uint16_t sessionId = (uint16_t)(millis() & 0xFFFF);
+  uint32_t imageCrc32 = calculateFileCrc32(f);
+  uint8_t buffer[FUOTA_CHUNK_SIZE];
+
+  if (calculatedPackets == 0 || calculatedPackets > 65535) {
+    Serial.println("Invalid packet count");
+    f.close();
+    return;
+  }
+
+  uint16_t totalPackets = (uint16_t)calculatedPackets;
 
   showStatus("Starting Broadcast...");
   Serial.println("Start LoRa Broadcast...");
+  Serial.printf("Session: %u | Size: %u | Chunk: %u | Packets: %u | CRC32: 0x%08X\n",
+                sessionId, (unsigned int)fileSize, FUOTA_CHUNK_SIZE, totalPackets,
+                (unsigned int)imageCrc32);
 
-  // 1. Send START Header
-  LoRa.beginPacket();
-  LoRa.print("START:");
-  LoRa.print(fileSize);
-  LoRa.endPacket();
+  // 1. Send firmware metadata frame
+  FuotaMetadata metadata;
+  metadata.fileSize = (uint32_t)fileSize;
+  metadata.chunkSize = FUOTA_CHUNK_SIZE;
+  metadata.totalPackets = totalPackets;
+  metadata.firmwareVersion = 1;
+  metadata.imageCrc32 = imageCrc32;
+
+  uint8_t metadataPayload[FUOTA_METADATA_PAYLOAD_SIZE];
+  fuotaWriteMetadata(metadataPayload, metadata);
+  sendFuotaFrame(FUOTA_FRAME_METADATA, sessionId, 0, metadataPayload, sizeof(metadataPayload));
   
-  // Give Node time to erase flash (important!)
+  // Give node time to prepare for the stream.
   delay(2000); 
 
   // 2. Loop Chunks
-  for (int i = 0; i < totalPackets; i++) {
-    int bytesRead = f.read(buffer, packetSize);
+  for (uint16_t i = 0; i < totalPackets; i++) {
+    int bytesRead = f.read(buffer, FUOTA_CHUNK_SIZE);
     
-    LoRa.beginPacket();
-    // Packet ID (2 Bytes)
-    LoRa.write((uint8_t)(i >> 8));
-    LoRa.write((uint8_t)(i & 0xFF));
-    // Data
-    LoRa.write(buffer, bytesRead);
-    LoRa.endPacket();
+    sendFuotaFrame(FUOTA_FRAME_DATA, sessionId, i, buffer, (uint8_t)bytesRead);
 
     // Update OLED every 20 packets (don't slow down too much)
     if (i % 20 == 0) {
@@ -173,10 +218,8 @@ void broadcastFromSD() {
     delay(50); 
   }
 
-  // 3. Send END
-  LoRa.beginPacket();
-  LoRa.print("END");
-  LoRa.endPacket();
+  // 3. Send END frame
+  sendFuotaFrame(FUOTA_FRAME_END, sessionId, totalPackets, NULL, 0);
   
   f.close();
   showStatus("Broadcast Success!");

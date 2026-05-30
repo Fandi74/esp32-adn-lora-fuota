@@ -1,6 +1,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <SSD1306Wire.h>
+#include <fuota_protocol.h>
 
 // ================= HARDWARE PINS (T3 V1.6.1) =================
 #define LORA_SCK     5
@@ -18,10 +19,15 @@
 SSD1306Wire display(OLED_ADDR, OLED_SDA, OLED_SCL);
 
 bool isReceiving = false;
-int totalExpectedPackets = 0;
+uint16_t activeSessionId = 0;
+uint32_t expectedFileSize = 0;
+uint16_t expectedChunkSize = 0;
+uint16_t totalExpectedPackets = 0;
+uint32_t expectedImageCrc32 = 0;
 int validPacketsReceived = 0;
 int highestIdReceived = -1;
 int lostPackets = 0;
+int badPackets = 0;
 
 void showStatus(String s) {
   display.clear();
@@ -34,95 +40,118 @@ void showStatus(String s) {
 // ================= FUNCTIONS =================
 
 void processPacket(int packetSize) {
-  uint8_t buffer[256]; 
+  uint8_t buffer[FUOTA_MAX_FRAME_SIZE];
   int i = 0;
   
-  while (LoRa.available()) {
+  while (LoRa.available() && i < (int)sizeof(buffer)) {
     buffer[i++] = LoRa.read();
   }
-  
-  String strData = "";
-  // Read up to 24 characters to safely capture "START:9999999"
-  int limit = (i < 24) ? i : 24;
-  for(int k=0; k<limit; k++) {
-    strData += (char)buffer[k];
+
+  while (LoRa.available()) {
+    LoRa.read();
   }
   
-  // --- COMMAND: START ---
-  if (strData.startsWith("START:")) {
-    String sizeStr = strData.substring(6);
-    size_t fileSize = sizeStr.toInt();
-    
-    // Gateway uses 250 bytes per packet.
-    totalExpectedPackets = (fileSize / 250) + 1;
-    
-    // Reset our profiling counters
+  FuotaFrameHeader header;
+  if (!fuotaReadFrameHeader(buffer, i, header)) {
+    Serial.printf("Invalid FUOTA frame. Size: %d\n", i);
+    return;
+  }
+
+  const uint8_t* payload = &buffer[FUOTA_HEADER_SIZE];
+  uint32_t actualPayloadCrc32 = fuotaCrc32(payload, header.payloadLen);
+  if (actualPayloadCrc32 != header.payloadCrc32) {
+    badPackets++;
+    Serial.printf("Bad packet CRC. Type: %u | ID: %u | Expected: 0x%08X | Got: 0x%08X\n",
+                  header.type, header.packetId, (unsigned int)header.payloadCrc32,
+                  (unsigned int)actualPayloadCrc32);
+    return;
+  }
+
+  if (header.type == FUOTA_FRAME_METADATA) {
+    if (header.payloadLen != FUOTA_METADATA_PAYLOAD_SIZE) {
+      Serial.printf("Invalid metadata payload size: %u\n", header.payloadLen);
+      return;
+    }
+
+    FuotaMetadata metadata = fuotaReadMetadata(payload);
+    activeSessionId = header.sessionId;
+    expectedFileSize = metadata.fileSize;
+    expectedChunkSize = metadata.chunkSize;
+    totalExpectedPackets = metadata.totalPackets;
+    expectedImageCrc32 = metadata.imageCrc32;
+
     isReceiving = true;
     validPacketsReceived = 0;
     highestIdReceived = -1;
     lostPackets = 0;
-    
-    Serial.printf("START received. Expecting %d packets.\n", totalExpectedPackets);
+    badPackets = 0;
+
+    Serial.println("\n--- FUOTA METADATA ---");
+    Serial.printf("Session: %u\n", activeSessionId);
+    Serial.printf("File size: %u\n", (unsigned int)expectedFileSize);
+    Serial.printf("Chunk size: %u\n", expectedChunkSize);
+    Serial.printf("Total packets: %u\n", totalExpectedPackets);
+    Serial.printf("Firmware version: %u\n", (unsigned int)metadata.firmwareVersion);
+    Serial.printf("Image CRC32: 0x%08X\n", (unsigned int)expectedImageCrc32);
+
     showStatus("Incoming stream...");
     return;
   }
 
-  // --- COMMAND: END ---
-  if (strData.startsWith("END")) {
+  if (header.sessionId != activeSessionId) {
+    Serial.printf("Ignoring old session frame. Active: %u | Got: %u\n",
+                  activeSessionId, header.sessionId);
+    return;
+  }
+
+  if (header.type == FUOTA_FRAME_END) {
     if (isReceiving) {
       isReceiving = false;
-      
-      // Calculate final stats
-      float finalCorruptRate = ((float)lostPackets / (float)totalExpectedPackets) * 100.0;
-      
+      lostPackets = totalExpectedPackets - validPacketsReceived;
+      float finalCorruptRate = totalExpectedPackets > 0
+        ? ((float)(lostPackets + badPackets) / (float)totalExpectedPackets) * 100.0
+        : 0.0;
+
       Serial.println("\n--- STREAM FINISHED ---");
-      Serial.printf("Expected: %d\n", totalExpectedPackets);
+      Serial.printf("Expected: %u\n", totalExpectedPackets);
       Serial.printf("Received: %d\n", validPacketsReceived);
-      Serial.printf("Lost/Corrupted: %d\n", lostPackets);
-      Serial.printf("Corruption Rate: %.2f%%\n", finalCorruptRate);
-      
-      // Final OLED Display
+      Serial.printf("Missing: %d\n", lostPackets);
+      Serial.printf("Bad CRC: %d\n", badPackets);
+      Serial.printf("Error Rate: %.2f%%\n", finalCorruptRate);
+
       display.clear();
       display.setFont(ArialMT_Plain_10);
       display.drawString(0, 0, "--- FINISHED ---");
       display.drawString(0, 15, "Rx: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
-      display.drawString(0, 30, "Lost: " + String(lostPackets));
+      display.drawString(0, 30, "Miss: " + String(lostPackets) + " Bad: " + String(badPackets));
       display.drawString(0, 45, "Rate: " + String(finalCorruptRate, 1) + "%");
       display.display();
 
-      // =========================================================
-      // PLACEHOLDER FOR CORRUPTION FIX (NACK / RETRY LOGIC)
-      // =========================================================
-      if (lostPackets > 0) {
-        Serial.println("[PLACEHOLDER] Generating list of missing IDs...");
-        Serial.println("[PLACEHOLDER] Sending NACK back to Gateway...");
-        // TODO: Build the missing packet array and send request via LoRa TX
+      if (lostPackets > 0 || badPackets > 0) {
+        Serial.println("[PLACEHOLDER] Generate missing packet list for retry.");
       } else {
-        Serial.println("[PLACEHOLDER] 100% Intact. Executing OTA Flash...");
+        Serial.println("[PLACEHOLDER] Image complete. Verify staged file before OTA.");
       }
-      // =========================================================
     }
     return;
   }
 
-  // --- DATA PACKET HANDLING ---
-  if (isReceiving && i >= 3) {
-    // 1. Extract the 2-byte Sequence ID
-    uint16_t packetId = (buffer[0] << 8) | buffer[1];
-    
-    // 2. Track the highest ID we've seen to detect gaps
-    if (packetId > highestIdReceived) {
-      highestIdReceived = packetId;
+  if (header.type == FUOTA_FRAME_DATA && isReceiving) {
+    if (header.payloadLen > expectedChunkSize) {
+      badPackets++;
+      Serial.printf("Unexpected payload length. ID: %u | Len: %u\n",
+                    header.packetId, header.payloadLen);
+      return;
     }
-    
+
+    if (header.packetId > highestIdReceived) {
+      highestIdReceived = header.packetId;
+    }
+
     validPacketsReceived++;
-    
-    // 3. Calculate how many we've lost so far
-    // If highest ID is 10, we SHOULD have received 11 packets (0 through 10)
     int expectedUpToNow = highestIdReceived + 1;
     lostPackets = expectedUpToNow - validPacketsReceived;
-    
-    // 4. Update OLED every 10 packets to keep UI responsive
+
     if (validPacketsReceived % 10 == 0) {
       float currentCorruptRate = ((float)lostPackets / (float)expectedUpToNow) * 100.0;
       
@@ -140,9 +169,14 @@ void processPacket(int packetSize) {
       display.drawString(0, 45, "Rate: " + String(currentCorruptRate, 1) + "%");
       display.display();
       
-      Serial.printf("ID: %d | Rx: %d | Lost: %d | Rate: %.1f%%\n", packetId, validPacketsReceived, lostPackets, currentCorruptRate);
+      Serial.printf("ID: %u | Len: %u | Rx: %d | Lost: %d | Bad: %d | Rate: %.1f%%\n",
+                    header.packetId, header.payloadLen, validPacketsReceived, lostPackets,
+                    badPackets, currentCorruptRate);
     }
+    return;
   }
+
+  Serial.printf("Unhandled FUOTA frame type: %u\n", header.type);
 }
 
 
