@@ -54,6 +54,17 @@ void drawProgressBar(uint8_t progressPercent) {
   display.fillRect(1, 55, fillWidth, 6);
 }
 
+bool isValidMetadata(const FuotaMetadata& metadata) {
+  if (metadata.fileSize == 0 || metadata.chunkSize != FUOTA_CHUNK_SIZE) {
+    return false;
+  }
+
+  uint32_t calculatedPackets = (metadata.fileSize + metadata.chunkSize - 1) / metadata.chunkSize;
+  return calculatedPackets > 0 &&
+         calculatedPackets <= 65535 &&
+         metadata.totalPackets == calculatedPackets;
+}
+
 void drawListeningAnimation() {
   unsigned long now = millis();
   if (now - lastOledFrameAt < OLED_IDLE_INTERVAL_MS) {
@@ -136,6 +147,15 @@ void processPacket(int packetSize) {
     }
 
     FuotaMetadata metadata = fuotaReadMetadata(payload);
+    if (!isValidMetadata(metadata)) {
+      Serial.println("Invalid metadata values. Ignoring FUOTA session.");
+      Serial.printf("File size: %u | Chunk size: %u | Total packets: %u\n",
+                    (unsigned int)metadata.fileSize, metadata.chunkSize,
+                    metadata.totalPackets);
+      showStatus("Bad metadata");
+      return;
+    }
+
     activeSessionId = header.sessionId;
     expectedFileSize = metadata.fileSize;
     expectedChunkSize = metadata.chunkSize;
@@ -169,9 +189,11 @@ void processPacket(int packetSize) {
   if (header.type == FUOTA_FRAME_END) {
     if (isReceiving) {
       isReceiving = false;
-      lostPackets = totalExpectedPackets - validPacketsReceived;
-      float finalCorruptRate = totalExpectedPackets > 0
-        ? ((float)(lostPackets + badPackets) / (float)totalExpectedPackets) * 100.0
+      lostPackets = totalExpectedPackets > validPacketsReceived
+        ? totalExpectedPackets - validPacketsReceived
+        : 0;
+      float finalMissingRate = totalExpectedPackets > 0
+        ? ((float)lostPackets / (float)totalExpectedPackets) * 100.0
         : 0.0;
 
       Serial.println("\n--- STREAM FINISHED ---");
@@ -179,14 +201,14 @@ void processPacket(int packetSize) {
       Serial.printf("Received: %d\n", validPacketsReceived);
       Serial.printf("Missing: %d\n", lostPackets);
       Serial.printf("Bad CRC: %d\n", badPackets);
-      Serial.printf("Error Rate: %.2f%%\n", finalCorruptRate);
+      Serial.printf("Missing Rate: %.2f%%\n", finalMissingRate);
 
       display.clear();
       display.setFont(ArialMT_Plain_10);
       display.drawString(0, 0, "--- FINISHED ---");
       display.drawString(0, 15, "Rx: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
       display.drawString(0, 30, "Miss: " + String(lostPackets) + " Bad: " + String(badPackets));
-      display.drawString(0, 45, "Rate: " + String(finalCorruptRate, 1) + "%");
+      display.drawString(0, 45, "Miss: " + String(finalMissingRate, 1) + "%");
       display.display();
 
       if (lostPackets > 0 || badPackets > 0) {
@@ -212,7 +234,9 @@ void processPacket(int packetSize) {
 
     validPacketsReceived++;
     int expectedUpToNow = highestIdReceived + 1;
-    lostPackets = expectedUpToNow - validPacketsReceived;
+    lostPackets = expectedUpToNow > validPacketsReceived
+      ? expectedUpToNow - validPacketsReceived
+      : 0;
     drawReceivingAnimation(false);
 
     if (validPacketsReceived % 10 == 0) {
