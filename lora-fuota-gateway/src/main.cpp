@@ -9,17 +9,20 @@
 
 // #include <mysecrets.h>
 
-#define WIFI_SSID "Daya Tani-Net"
-#define WIFI_PASSWORD "DayaTani-2025!"
-#define BROKER_SERVER "broker.hivemq.com"
+#define WIFI_SSID "Damai 2-2"
+#define WIFI_PASSWORD "Damaimei2026"
+#define BROKER_SERVER "broker.emqx.io"
+#define BROKER_PORT 1883
+#define MQTT_CLIENT_ID "fuota-gateway-esp32"
 #define LORA_TOPIC "lora/ota/url"
 #define DATA_SIZE 102400
 
 // ================= USER CONFIG =================
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
-const char* mqtt_server = BROKER_SERVER ; //broker.hivemq.com
+const char* mqtt_server = BROKER_SERVER;
 const char* mqtt_topic = LORA_TOPIC; //lora/ota/url
+const char* mqtt_client_id = MQTT_CLIENT_ID;
 
 #define LORA_SCK     5
 #define LORA_MISO    19
@@ -280,14 +283,14 @@ void setup() {
   showStatus("WiFi OK.");
 
   // 5. Connect MQTT (Timeout: 120s)
-  client.setServer(mqtt_server, 1883);
+  client.setServer(mqtt_server, BROKER_PORT);
   client.setCallback(mqttCallback);
   
   unsigned long mqttStart = millis();
   showStatus("Connecting Broker...");
   
   while (!client.connected()) {
-    if (client.connect("T3_Gateway_Client")) {
+    if (client.connect(mqtt_client_id)) {
       Serial.println("Broker Connected");
       client.subscribe(mqtt_topic, 1); // QoS 1
     } else {
@@ -309,7 +312,7 @@ void loop() {
   if (!client.connected()) {
      // Optional: Reconnect logic if you want, or just fail based on your strict rules.
      // For now, we assume if it drops, we try to reconnect simply.
-     if (client.connect("T3_Gateway_Client")) {
+     if (client.connect(mqtt_client_id)) {
         client.subscribe(mqtt_topic, 1);
      }
   }

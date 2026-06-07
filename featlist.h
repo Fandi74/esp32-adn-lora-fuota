@@ -81,4 +81,26 @@
   14. Small test firmware first
       - Validate the protocol with a small dummy binary or tiny firmware before
         trying a full 500 KB image.
+
+  15. Prototype architecture modules
+      - Boot manager: decide normal boot, update mode, rollback mode, or safe
+        mode based on stored state.
+      - Config manager: keep LoRa, MQTT, WiFi, chunk size, retry limit, and
+        storage settings in one place.
+      - LoRa packet protocol: own frame encoding, decoding, frame types,
+        session IDs, packet IDs, payload length, and packet CRC.
+      - FUOTA session manager: coordinate metadata, transfer start/end,
+        timeout, retry rounds, and session cleanup.
+      - Fragment bitmap: track received packet IDs and produce the missing
+        packet list after each pass.
+      - OTA writer: write verified firmware from staging storage into the ESP32
+        OTA partition.
+      - Hash verifier: verify packet CRC during receive and full image hash
+        before OTA write.
+      - Rollback/safe mode: recover if the updated firmware fails to boot or
+        report healthy state.
+      - Health report: expose update result, firmware version, packet stats,
+        and boot status over Serial, OLED, or MQTT later.
+      - Event log: keep simple update events such as start, download success,
+        bad packet, retry request, verify result, OTA result, and reboot cause.
 */
