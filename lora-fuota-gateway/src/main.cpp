@@ -5,20 +5,24 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <SSD1306Wire.h>
+#include <fuota_protocol.h>
 
 // #include <mysecrets.h>
 
-#define WIFI_SSID "Daya Tani-Net"
-#define WIFI_PASSWORD "DayaTani-2025!"
-#define BROKER_SERVER "broker.hivemq.com"
+#define WIFI_SSID "Damai 2-2"
+#define WIFI_PASSWORD "Damaimei2026"
+#define BROKER_SERVER "broker.emqx.io"
+#define BROKER_PORT 1883
+#define MQTT_CLIENT_ID "fuota-gateway-esp32"
 #define LORA_TOPIC "lora/ota/url"
 #define DATA_SIZE 102400
 
 // ================= USER CONFIG =================
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
-const char* mqtt_server = BROKER_SERVER ; //broker.hivemq.com
+const char* mqtt_server = BROKER_SERVER;
 const char* mqtt_topic = LORA_TOPIC; //lora/ota/url
+const char* mqtt_client_id = MQTT_CLIENT_ID;
 
 #define LORA_SCK     5
 #define LORA_MISO    19
@@ -66,6 +70,38 @@ void showStatus(String s) {
   display.drawString(0, 0, "GW Status:");
   display.drawString(0, 25, s);
   display.display();
+}
+
+uint32_t calculateFileCrc32(File& f) {
+  uint8_t buffer[256];
+  uint32_t crc = 0xFFFFFFFFUL;
+
+  f.seek(0);
+  while (f.available()) {
+    int bytesRead = f.read(buffer, sizeof(buffer));
+    if (bytesRead > 0) {
+      crc = fuotaCrc32Update(crc, buffer, bytesRead);
+    }
+  }
+  f.seek(0);
+
+  return ~crc;
+}
+
+bool sendFuotaFrame(uint8_t type, uint16_t sessionId, uint16_t packetId,
+                    const uint8_t* payload, uint8_t payloadLen) {
+  if (payloadLen > FUOTA_MAX_PAYLOAD_SIZE) {
+    Serial.println("FUOTA payload too large");
+    return false;
+  }
+
+  uint8_t frame[FUOTA_MAX_FRAME_SIZE];
+  size_t frameLen = fuotaWriteFrame(frame, type, sessionId, packetId, payload, payloadLen);
+
+  LoRa.beginPacket();
+  LoRa.write(frame, frameLen);
+  LoRa.endPacket();
+  return true;
 }
 
 // Download HTTP -> SD Card
@@ -131,33 +167,46 @@ void broadcastFromSD() {
   }
 
   size_t fileSize = f.size();
-  int packetSize = 250; 
-  int totalPackets = (fileSize / packetSize) + 1;
-  uint8_t buffer[packetSize];
+  uint32_t calculatedPackets = (fileSize + FUOTA_CHUNK_SIZE - 1) / FUOTA_CHUNK_SIZE;
+  uint16_t sessionId = (uint16_t)(millis() & 0xFFFF);
+  uint32_t imageCrc32 = calculateFileCrc32(f);
+  uint8_t buffer[FUOTA_CHUNK_SIZE];
+
+  if (calculatedPackets == 0 || calculatedPackets > FUOTA_MAX_TRACKED_PACKETS) {
+    Serial.printf("Invalid packet count: %u. Prototype limit is %u packets.\n",
+                  (unsigned int)calculatedPackets, FUOTA_MAX_TRACKED_PACKETS);
+    f.close();
+    return;
+  }
+
+  uint16_t totalPackets = (uint16_t)calculatedPackets;
 
   showStatus("Starting Broadcast...");
   Serial.println("Start LoRa Broadcast...");
+  Serial.printf("Session: %u | Size: %u | Chunk: %u | Packets: %u | CRC32: 0x%08X\n",
+                sessionId, (unsigned int)fileSize, FUOTA_CHUNK_SIZE, totalPackets,
+                (unsigned int)imageCrc32);
 
-  // 1. Send START Header
-  LoRa.beginPacket();
-  LoRa.print("START:");
-  LoRa.print(fileSize);
-  LoRa.endPacket();
+  // 1. Send firmware metadata frame
+  FuotaMetadata metadata;
+  metadata.fileSize = (uint32_t)fileSize;
+  metadata.chunkSize = FUOTA_CHUNK_SIZE;
+  metadata.totalPackets = totalPackets;
+  metadata.firmwareVersion = 1;
+  metadata.imageCrc32 = imageCrc32;
+
+  uint8_t metadataPayload[FUOTA_METADATA_PAYLOAD_SIZE];
+  fuotaWriteMetadata(metadataPayload, metadata);
+  sendFuotaFrame(FUOTA_FRAME_METADATA, sessionId, 0, metadataPayload, sizeof(metadataPayload));
   
-  // Give Node time to erase flash (important!)
+  // Give node time to prepare for the stream.
   delay(2000); 
 
   // 2. Loop Chunks
-  for (int i = 0; i < totalPackets; i++) {
-    int bytesRead = f.read(buffer, packetSize);
+  for (uint16_t i = 0; i < totalPackets; i++) {
+    int bytesRead = f.read(buffer, FUOTA_CHUNK_SIZE);
     
-    LoRa.beginPacket();
-    // Packet ID (2 Bytes)
-    LoRa.write((uint8_t)(i >> 8));
-    LoRa.write((uint8_t)(i & 0xFF));
-    // Data
-    LoRa.write(buffer, bytesRead);
-    LoRa.endPacket();
+    sendFuotaFrame(FUOTA_FRAME_DATA, sessionId, i, buffer, (uint8_t)bytesRead);
 
     // Update OLED every 20 packets (don't slow down too much)
     if (i % 20 == 0) {
@@ -173,10 +222,8 @@ void broadcastFromSD() {
     delay(50); 
   }
 
-  // 3. Send END
-  LoRa.beginPacket();
-  LoRa.print("END");
-  LoRa.endPacket();
+  // 3. Send END frame
+  sendFuotaFrame(FUOTA_FRAME_END, sessionId, totalPackets, NULL, 0);
   
   f.close();
   showStatus("Broadcast Success!");
@@ -236,14 +283,14 @@ void setup() {
   showStatus("WiFi OK.");
 
   // 5. Connect MQTT (Timeout: 120s)
-  client.setServer(mqtt_server, 1883);
+  client.setServer(mqtt_server, BROKER_PORT);
   client.setCallback(mqttCallback);
   
   unsigned long mqttStart = millis();
   showStatus("Connecting Broker...");
   
   while (!client.connected()) {
-    if (client.connect("T3_Gateway_Client")) {
+    if (client.connect(mqtt_client_id)) {
       Serial.println("Broker Connected");
       client.subscribe(mqtt_topic, 1); // QoS 1
     } else {
@@ -265,7 +312,7 @@ void loop() {
   if (!client.connected()) {
      // Optional: Reconnect logic if you want, or just fail based on your strict rules.
      // For now, we assume if it drops, we try to reconnect simply.
-     if (client.connect("T3_Gateway_Client")) {
+     if (client.connect(mqtt_client_id)) {
         client.subscribe(mqtt_topic, 1);
      }
   }
