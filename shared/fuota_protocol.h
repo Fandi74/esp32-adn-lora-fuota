@@ -9,7 +9,7 @@ static const uint8_t FUOTA_MAGIC_1 = 'U';
 static const uint8_t FUOTA_MAGIC_2 = 'O';
 static const uint8_t FUOTA_MAGIC_3 = 'T';
 
-static const uint8_t FUOTA_PROTOCOL_VERSION = 1;
+static const uint8_t FUOTA_PROTOCOL_VERSION = 2;
 
 static const uint8_t FUOTA_FRAME_METADATA = 1;
 static const uint8_t FUOTA_FRAME_DATA = 2;
@@ -28,7 +28,7 @@ struct FuotaFrameHeader {
   uint16_t sessionId;
   uint16_t packetId;
   uint8_t payloadLen;
-  uint32_t payloadCrc32;
+  uint32_t frameCrc32;
 };
 
 struct FuotaMetadata {
@@ -80,6 +80,18 @@ inline uint32_t fuotaCrc32(const uint8_t* data, size_t len) {
   return ~fuotaCrc32Update(0xFFFFFFFFUL, data, len);
 }
 
+inline uint32_t fuotaFrameCrc32(const uint8_t* frame, const uint8_t* payload, size_t payloadLen) {
+  uint32_t crc = fuotaCrc32Update(0xFFFFFFFFUL, frame, 11);
+  return ~fuotaCrc32Update(crc, payload, payloadLen);
+}
+
+inline uint16_t fuotaExpectedPacketLength(uint32_t fileSize, uint16_t chunkSize,
+                                          uint16_t packetId, uint16_t totalPackets) {
+  return packetId == totalPackets - 1
+    ? fileSize - (uint32_t)packetId * chunkSize
+    : chunkSize;
+}
+
 inline bool fuotaHasValidMagic(const uint8_t* frame, size_t frameLen) {
   return frameLen >= FUOTA_HEADER_SIZE &&
          frame[0] == FUOTA_MAGIC_0 &&
@@ -100,7 +112,7 @@ inline size_t fuotaWriteFrame(uint8_t* frame, uint8_t type, uint16_t sessionId,
   fuotaWriteU16(&frame[6], sessionId);
   fuotaWriteU16(&frame[8], packetId);
   frame[10] = payloadLen;
-  fuotaWriteU32(&frame[11], fuotaCrc32(payload, payloadLen));
+  fuotaWriteU32(&frame[11], fuotaFrameCrc32(frame, payload, payloadLen));
 
   for (uint8_t i = 0; i < payloadLen; i++) {
     frame[FUOTA_HEADER_SIZE + i] = payload[i];
@@ -118,7 +130,7 @@ inline bool fuotaReadFrameHeader(const uint8_t* frame, size_t frameLen, FuotaFra
   header.sessionId = fuotaReadU16(&frame[6]);
   header.packetId = fuotaReadU16(&frame[8]);
   header.payloadLen = frame[10];
-  header.payloadCrc32 = fuotaReadU32(&frame[11]);
+  header.frameCrc32 = fuotaReadU32(&frame[11]);
 
   return frameLen == (size_t)(FUOTA_HEADER_SIZE + header.payloadLen);
 }

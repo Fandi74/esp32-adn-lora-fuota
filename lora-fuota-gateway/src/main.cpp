@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <LoRa.h>
 #include <SSD1306Wire.h>
 #include <fuota_protocol.h>
@@ -15,7 +16,6 @@
 #define BROKER_PORT 1883
 #define MQTT_CLIENT_ID "fuota-gateway-esp32"
 #define LORA_TOPIC "lora/ota/url"
-#define DATA_SIZE 102400
 
 // ================= USER CONFIG =================
 const char* ssid = WIFI_SSID;
@@ -28,7 +28,7 @@ const char* mqtt_client_id = MQTT_CLIENT_ID;
 #define LORA_MISO    19
 #define LORA_MOSI    27
 #define LORA_CS      18
-#define LORA_RST     23
+#define FUOTA_LORA_RST 23
 #define LORA_DIO0    26
 
 #define SD_SCK       14
@@ -36,18 +36,19 @@ const char* mqtt_client_id = MQTT_CLIENT_ID;
 #define SD_MOSI      15
 #define SD_CS        13
 
-#define OLED_SDA     21
-#define OLED_SCL     22
+#define FUOTA_OLED_SDA 21
+#define FUOTA_OLED_SCL 22
 #define OLED_ADDR    0x3C
 
 // ================= GLOBALS =================
-SSD1306Wire display(OLED_ADDR, OLED_SDA, OLED_SCL);
+SSD1306Wire display(OLED_ADDR, FUOTA_OLED_SDA, FUOTA_OLED_SCL);
 WiFiClient espClient;
 PubSubClient client(espClient);
 SPIClass sdSPI(HSPI); // Create a separate SPI instance for SD Card
 
 String downloadUrl = "";
 bool startProcess = false;
+bool oledReady = false;
 
 // ================= FUNCTIONS =================
 
@@ -65,6 +66,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 // Helper for OLED
 void showStatus(String s) {
+  if (!oledReady) return;
   display.clear();
   display.setFont(ArialMT_Plain_10);
   display.drawString(0, 0, "GW Status:");
@@ -72,20 +74,22 @@ void showStatus(String s) {
   display.display();
 }
 
-uint32_t calculateFileCrc32(File& f) {
+bool calculateFileCrc32(File& f, uint32_t& result) {
   uint8_t buffer[256];
   uint32_t crc = 0xFFFFFFFFUL;
+  size_t remaining = f.size();
 
-  f.seek(0);
-  while (f.available()) {
-    int bytesRead = f.read(buffer, sizeof(buffer));
-    if (bytesRead > 0) {
-      crc = fuotaCrc32Update(crc, buffer, bytesRead);
-    }
+  if (!f.seek(0)) return false;
+  while (remaining > 0) {
+    size_t toRead = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    int bytesRead = f.read(buffer, toRead);
+    if (bytesRead != (int)toRead) return false;
+    crc = fuotaCrc32Update(crc, buffer, bytesRead);
+    remaining -= bytesRead;
   }
-  f.seek(0);
 
-  return ~crc;
+  result = ~crc;
+  return f.seek(0);
 }
 
 bool sendFuotaFrame(uint8_t type, uint16_t sessionId, uint16_t packetId,
@@ -98,10 +102,9 @@ bool sendFuotaFrame(uint8_t type, uint16_t sessionId, uint16_t packetId,
   uint8_t frame[FUOTA_MAX_FRAME_SIZE];
   size_t frameLen = fuotaWriteFrame(frame, type, sessionId, packetId, payload, payloadLen);
 
-  LoRa.beginPacket();
-  LoRa.write(frame, frameLen);
-  LoRa.endPacket();
-  return true;
+  if (!LoRa.beginPacket()) return false;
+  if (LoRa.write(frame, frameLen) != frameLen) return false;
+  return LoRa.endPacket() == 1;
 }
 
 // Download HTTP -> SD Card
@@ -109,74 +112,89 @@ bool downloadToSD(String url) {
   HTTPClient http;
   showStatus("Downloading...");
   Serial.println("Downloading " + url);
-  
-  http.begin(url);
+
+  if (!http.begin(url)) {
+    Serial.println("Invalid download URL");
+    return false;
+  }
+
   int httpCode = http.GET();
-
-  if (httpCode == 200) {
-    // Open file on SD (Overwrite mode)
-    // Note: SD library uses O_WRITE | O_CREAT | O_TRUNC by default for FILE_WRITE? 
-    // Actually SD.open usually appends. We must remove first.
-    if (SD.exists("/update.bin")) SD.remove("/update.bin");
-    
-    File f = SD.open("/update.bin", FILE_WRITE);
-    if (!f) {
-      Serial.println("SD Write Error");
-      return false;
-    } 
-
-    int len = http.getSize();
-    WiFiClient * stream = http.getStreamPtr();
-    uint8_t buff[512];
-    int total = 0;
-    
-    while (http.connected() && (len > 0 || len == -1)) {
-      size_t size = stream->available();
-      if (size) {
-        int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
-        f.write(buff, c);
-        
-        if (len > 0) len -= c;
-        total += c;
-        
-        if (total % DATA_SIZE == 0) { // Update log every 100KB
-           showStatus("DL: " + String(total/1024) + " KB");
-        }
-      }
-      delay(1);
-    }
-    f.close();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("HTTP Failed: %d\n", httpCode);
     http.end();
-    
-    Serial.printf("Download Success: %d bytes\n", total);
-    showStatus("DL Complete!");
-    return true;
-  } 
-  
-  Serial.printf("HTTP Failed: %d\n", httpCode);
+    return false;
+  }
+
+  int expectedSize = http.getSize();
+  const size_t maxImageSize = (size_t)FUOTA_CHUNK_SIZE * FUOTA_MAX_TRACKED_PACKETS;
+  if (expectedSize == 0 || (expectedSize > 0 && (size_t)expectedSize > maxImageSize)) {
+    Serial.printf("Invalid image size: %d\n", expectedSize);
+    http.end();
+    return false;
+  }
+
+  if (SD.exists("/update.tmp") && !SD.remove("/update.tmp")) {
+    Serial.println("Could not remove previous temporary download");
+    http.end();
+    return false;
+  }
+  File f = SD.open("/update.tmp", FILE_WRITE);
+  if (!f) {
+    Serial.println("SD Write Error");
+    http.end();
+    return false;
+  }
+
+  int written = http.writeToStream(&f);
+  f.flush();
+  size_t stored = f.size();
+  f.close();
   http.end();
-  return false;
+
+  if (written <= 0 || stored != (size_t)written || stored > maxImageSize ||
+      (expectedSize >= 0 && written != expectedSize)) {
+    Serial.printf("Incomplete download: HTTP=%d SD=%u expected=%d\n",
+                  written, (unsigned int)stored, expectedSize);
+    SD.remove("/update.tmp");
+    return false;
+  }
+
+  if ((SD.exists("/update.bin") && !SD.remove("/update.bin")) ||
+      !SD.rename("/update.tmp", "/update.bin")) {
+    Serial.println("Could not replace update.bin");
+    return false;
+  }
+
+  Serial.printf("Download Success: %u bytes\n", (unsigned int)stored);
+  showStatus("DL Complete!");
+  return true;
 }
 
 // Read SD -> LoRa Broadcast
-void broadcastFromSD() {
+bool broadcastFromSD() {
   File f = SD.open("/update.bin", FILE_READ);
   if (!f) {
     Serial.println("Cannot open file for broadcast");
-    return;
+    return false;
   }
 
   size_t fileSize = f.size();
   uint32_t calculatedPackets = (fileSize + FUOTA_CHUNK_SIZE - 1) / FUOTA_CHUNK_SIZE;
   uint16_t sessionId = (uint16_t)(millis() & 0xFFFF);
-  uint32_t imageCrc32 = calculateFileCrc32(f);
+  uint32_t imageCrc32 = 0;
   uint8_t buffer[FUOTA_CHUNK_SIZE];
 
   if (calculatedPackets == 0 || calculatedPackets > FUOTA_MAX_TRACKED_PACKETS) {
     Serial.printf("Invalid packet count: %u. Prototype limit is %u packets.\n",
                   (unsigned int)calculatedPackets, FUOTA_MAX_TRACKED_PACKETS);
     f.close();
-    return;
+    return false;
+  }
+
+  if (!calculateFileCrc32(f, imageCrc32)) {
+    Serial.println("Could not read complete image for CRC32");
+    f.close();
+    return false;
   }
 
   uint16_t totalPackets = (uint16_t)calculatedPackets;
@@ -197,19 +215,32 @@ void broadcastFromSD() {
 
   uint8_t metadataPayload[FUOTA_METADATA_PAYLOAD_SIZE];
   fuotaWriteMetadata(metadataPayload, metadata);
-  sendFuotaFrame(FUOTA_FRAME_METADATA, sessionId, 0, metadataPayload, sizeof(metadataPayload));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (!sendFuotaFrame(FUOTA_FRAME_METADATA, sessionId, 0, metadataPayload, sizeof(metadataPayload))) {
+      Serial.println("Metadata TX failed");
+      f.close();
+      return false;
+    }
+    delay(200);
+  }
   
   // Give node time to prepare for the stream.
   delay(2000); 
 
   // 2. Loop Chunks
   for (uint16_t i = 0; i < totalPackets; i++) {
-    int bytesRead = f.read(buffer, FUOTA_CHUNK_SIZE);
-    
-    sendFuotaFrame(FUOTA_FRAME_DATA, sessionId, i, buffer, (uint8_t)bytesRead);
+    size_t expectedBytes = fuotaExpectedPacketLength(
+      fileSize, FUOTA_CHUNK_SIZE, i, totalPackets);
+    int bytesRead = f.read(buffer, expectedBytes);
+    if (bytesRead != (int)expectedBytes ||
+        !sendFuotaFrame(FUOTA_FRAME_DATA, sessionId, i, buffer, (uint8_t)bytesRead)) {
+      Serial.printf("Packet %u read/TX failed\n", i);
+      f.close();
+      return false;
+    }
 
     // Update OLED every 20 packets (don't slow down too much)
-    if (i % 20 == 0) {
+    if (oledReady && i % 20 == 0) {
       String status = "Tx: " + String(i) + "/" + String(totalPackets);
       display.clear();
       display.drawString(0, 0, "Broadcasting...");
@@ -223,11 +254,18 @@ void broadcastFromSD() {
   }
 
   // 3. Send END frame
-  sendFuotaFrame(FUOTA_FRAME_END, sessionId, totalPackets, NULL, 0);
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (!sendFuotaFrame(FUOTA_FRAME_END, sessionId, totalPackets, NULL, 0)) {
+      Serial.println("END TX failed");
+      f.close();
+      return false;
+    }
+    delay(200);
+  }
   
   f.close();
-  showStatus("Broadcast Success!");
   Serial.println("Broadcast Finished.");
+  return true;
 }
 
 // ================= SETUP =================
@@ -241,6 +279,12 @@ void setup() {
   display.init();
   display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
+  Wire.beginTransmission(OLED_ADDR);
+  oledReady = Wire.endTransmission() == 0;
+  if (!oledReady) {
+    Serial.printf("OLED not responding at 0x%02X on SDA %d / SCL %d\n",
+                  OLED_ADDR, FUOTA_OLED_SDA, FUOTA_OLED_SCL);
+  }
   showStatus("Booting...");
 
   // 2. Init SD Card (on separate SPI bus)
@@ -254,7 +298,7 @@ void setup() {
 
   // 3. Init LoRa (on default SPI bus)
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  LoRa.setPins(LORA_CS, FUOTA_LORA_RST, LORA_DIO0);
   if (!LoRa.begin(923E6)) {
     Serial.println("LoRa Init Failed!");
     showStatus("LoRa Fail!");
@@ -263,6 +307,7 @@ void setup() {
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5); // 4/5
+  LoRa.enableCrc();
   Serial.println("LoRa Ready (923MHz).");
 
   // 4. Connect WiFi (Timeout: 60s)
@@ -325,12 +370,14 @@ void loop() {
     // Step A: Download
     if (downloadToSD(downloadUrl)) {
       // Step B: Broadcast
-      broadcastFromSD();
+      if (broadcastFromSD()) {
+        showStatus("Sent. Waiting...");
+      } else {
+        showStatus("Broadcast Error");
+      }
     } else {
       showStatus("Download Error");
     }
     
-    // Resume listening
-    showStatus("Job Done. Waiting...");
   }
 }

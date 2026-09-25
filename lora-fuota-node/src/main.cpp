@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <Wire.h>
 #include <LoRa.h>
 #include <SSD1306Wire.h>
 #include <fuota_protocol.h>
@@ -8,15 +9,15 @@
 #define LORA_MISO    19
 #define LORA_MOSI    27
 #define LORA_CS      18
-#define LORA_RST     23
+#define FUOTA_LORA_RST 23
 #define LORA_DIO0    26
 
-#define OLED_SDA     21
-#define OLED_SCL     22
+#define FUOTA_OLED_SDA 21
+#define FUOTA_OLED_SCL 22
 #define OLED_ADDR    0x3C
 
 // ================= GLOBALS =================
-SSD1306Wire display(OLED_ADDR, OLED_SDA, OLED_SCL);
+SSD1306Wire display(OLED_ADDR, FUOTA_OLED_SDA, FUOTA_OLED_SCL);
 
 bool isReceiving = false;
 uint16_t activeSessionId = 0;
@@ -32,12 +33,17 @@ int duplicatePackets = 0;
 unsigned long lastOledFrameAt = 0;
 uint8_t oledFrame = 0;
 uint8_t receivedPacketBitmap[FUOTA_RECEIVE_BITMAP_SIZE];
+bool oledReady = false;
+bool holdOledResult = false;
+unsigned long oledResultAt = 0;
 
 const unsigned long OLED_IDLE_INTERVAL_MS = 500;
 const unsigned long OLED_RX_INTERVAL_MS = 150;
+const unsigned long OLED_RESULT_HOLD_MS = 10000;
 const uint8_t MAX_MISSING_IDS_TO_LOG = 32;
 
 void showStatus(String s) {
+  if (!oledReady) return;
   display.clear();
   display.setFont(ArialMT_Plain_10);
   display.drawString(0, 0, "Node Status:");
@@ -130,6 +136,7 @@ void printMissingPacketPreview() {
 }
 
 void drawListeningAnimation() {
+  if (!oledReady) return;
   unsigned long now = millis();
   if (now - lastOledFrameAt < OLED_IDLE_INTERVAL_MS) {
     return;
@@ -152,6 +159,7 @@ void drawListeningAnimation() {
 }
 
 void drawReceivingAnimation(bool force) {
+  if (!oledReady) return;
   unsigned long now = millis();
   if (!force && now - lastOledFrameAt < OLED_RX_INTERVAL_MS) {
     return;
@@ -195,12 +203,12 @@ void processPacket(int packetSize) {
   }
 
   const uint8_t* payload = &buffer[FUOTA_HEADER_SIZE];
-  uint32_t actualPayloadCrc32 = fuotaCrc32(payload, header.payloadLen);
-  if (actualPayloadCrc32 != header.payloadCrc32) {
+  uint32_t actualFrameCrc32 = fuotaFrameCrc32(buffer, payload, header.payloadLen);
+  if (actualFrameCrc32 != header.frameCrc32) {
     badPackets++;
-    Serial.printf("Bad packet CRC. Type: %u | ID: %u | Expected: 0x%08X | Got: 0x%08X\n",
-                  header.type, header.packetId, (unsigned int)header.payloadCrc32,
-                  (unsigned int)actualPayloadCrc32);
+    Serial.printf("Bad frame CRC. Type: %u | ID: %u | Expected: 0x%08X | Got: 0x%08X\n",
+                  header.type, header.packetId, (unsigned int)header.frameCrc32,
+                  (unsigned int)actualFrameCrc32);
     return;
   }
 
@@ -217,6 +225,16 @@ void processPacket(int packetSize) {
                     (unsigned int)metadata.fileSize, metadata.chunkSize,
                     metadata.totalPackets);
       showStatus("Bad metadata");
+      holdOledResult = true;
+      oledResultAt = millis();
+      return;
+    }
+
+    if (isReceiving && header.sessionId == activeSessionId &&
+        metadata.fileSize == expectedFileSize &&
+        metadata.chunkSize == expectedChunkSize &&
+        metadata.totalPackets == totalExpectedPackets &&
+        metadata.imageCrc32 == expectedImageCrc32) {
       return;
     }
 
@@ -227,6 +245,7 @@ void processPacket(int packetSize) {
     expectedImageCrc32 = metadata.imageCrc32;
 
     isReceiving = true;
+    holdOledResult = false;
     validPacketsReceived = 0;
     highestIdReceived = -1;
     lostPackets = 0;
@@ -268,13 +287,17 @@ void processPacket(int packetSize) {
       Serial.printf("Duplicates: %d\n", duplicatePackets);
       Serial.printf("Missing Rate: %.2f%%\n", finalMissingRate);
 
-      display.clear();
-      display.setFont(ArialMT_Plain_10);
-      display.drawString(0, 0, "--- FINISHED ---");
-      display.drawString(0, 15, "Rx: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
-      display.drawString(0, 30, "M:" + String(lostPackets) + " B:" + String(badPackets) + " D:" + String(duplicatePackets));
-      display.drawString(0, 45, "Miss: " + String(finalMissingRate, 1) + "%");
-      display.display();
+      if (oledReady) {
+        display.clear();
+        display.setFont(ArialMT_Plain_10);
+        display.drawString(0, 0, "--- FINISHED ---");
+        display.drawString(0, 15, "Rx: " + String(validPacketsReceived) + "/" + String(totalExpectedPackets));
+        display.drawString(0, 30, "M:" + String(lostPackets) + " B:" + String(badPackets) + " D:" + String(duplicatePackets));
+        display.drawString(0, 45, "Miss: " + String(finalMissingRate, 1) + "%");
+        display.display();
+      }
+      holdOledResult = true;
+      oledResultAt = millis();
 
       if (lostPackets > 0) {
         printMissingPacketPreview();
@@ -294,10 +317,12 @@ void processPacket(int packetSize) {
       return;
     }
 
-    if (header.payloadLen > expectedChunkSize) {
+    uint16_t expectedLength = fuotaExpectedPacketLength(
+      expectedFileSize, expectedChunkSize, header.packetId, totalExpectedPackets);
+    if (header.payloadLen != expectedLength) {
       badPackets++;
-      Serial.printf("Unexpected payload length. ID: %u | Len: %u\n",
-                    header.packetId, header.payloadLen);
+      Serial.printf("Unexpected payload length. ID: %u | Len: %u | Expected: %u\n",
+                    header.packetId, header.payloadLen, (unsigned int)expectedLength);
       return;
     }
 
@@ -342,11 +367,17 @@ void setup() {
   display.init();
   display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
+  Wire.beginTransmission(OLED_ADDR);
+  oledReady = Wire.endTransmission() == 0;
+  if (!oledReady) {
+    Serial.printf("OLED not responding at 0x%02X on SDA %d / SCL %d\n",
+                  OLED_ADDR, FUOTA_OLED_SDA, FUOTA_OLED_SCL);
+  }
   showStatus("Node Booting...");
 
   // 2. Init LoRa
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  LoRa.setPins(LORA_CS, FUOTA_LORA_RST, LORA_DIO0);
   
   if (!LoRa.begin(923E6)) {
     Serial.println("LoRa Init Failed!");
@@ -358,6 +389,7 @@ void setup() {
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
   
   Serial.println("Node Ready. Profiling Mode.");
   showStatus("Listening..."); 
@@ -369,7 +401,10 @@ void loop() {
     processPacket(packetSize);
   } else if (isReceiving) {
     drawReceivingAnimation(false);
+  } else if (holdOledResult && millis() - oledResultAt < OLED_RESULT_HOLD_MS) {
+    return;
   } else {
+    holdOledResult = false;
     drawListeningAnimation();
   }
 }
